@@ -1,0 +1,3 @@
+#EXTM3U url-tvg="https://example.org/epg.xml"
+#EXTINF:-1 tvg-id="demo.channel" tvg-logo="https://example.org/logo.png" group-title="Демо" catchup="append" catchup-days="7" catchup-source="?utc=${start}&lutc=${timestamp}",Демо-канал
+https://example.org/live/demo/index.m3u8
