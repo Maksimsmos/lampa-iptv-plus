@@ -5,7 +5,7 @@
     window.lampa_iptv_plus_ready = true;
 
     var PLUGIN = 'iptv_plus';
-    var VERSION = '0.1.0';
+    var VERSION = '0.2.0';
     var network = new Lampa.Reguest();
     var state = {
         channels: [],
@@ -445,7 +445,7 @@
         if (!force && state.channels.length && Date.now() - state.loadedAt < 600000) return Promise.resolve(state);
 
         var playlistUrl = field('playlist');
-        if (!playlistUrl) return Promise.reject(new Error('Укажите URL плейлиста в Настройки → IPTV+'));
+        if (!playlistUrl) return Promise.reject(new Error('Нажмите «Плейлист» и укажите URL M3U'));
 
         return requestText(playlistUrl).then(function (m3u) {
             var parsed = parseM3U(m3u);
@@ -473,6 +473,40 @@
                 state.epg = {};
                 state.epgNames = {};
                 return state;
+            });
+        });
+    }
+
+    function editPlaylist(component) {
+        Lampa.Input.edit({
+            title: 'URL M3U-плейлиста',
+            value: field('playlist') || '',
+            free: true,
+            nosave: true,
+            nomic: true
+        }, function (value) {
+            Lampa.Controller.toggle('content');
+
+            value = text(value).trim();
+            if (!value) return;
+
+            Lampa.Storage.set(PLUGIN + '_playlist', value);
+            state.channels = [];
+            state.visible = [];
+            state.loadedAt = 0;
+            component.activity.loader(true);
+
+            loadData(true).then(function () {
+                component.build();
+                component.activity.loader(false);
+                component.start();
+                notify('Плейлист IPTV+ сохранён');
+            }).catch(function (error) {
+                component.activity.loader(false);
+                component.html.find('.iptv-plus-grid').html('<div class="iptv-plus-error">' + escapeHtml(error.message || error) + '</div>');
+                component.buildToolbar();
+                component.start();
+                notify(error.message || 'Не удалось загрузить плейлист');
             });
         });
     }
@@ -519,9 +553,11 @@
         this.buildToolbar = function () {
             var toolbar = self.html.find('.iptv-plus-toolbar').empty();
             var groupButton = $('<div class="iptv-plus-button selector">Категория: <b>' + escapeHtml(self.group || 'Все каналы') + '</b></div>');
+            var playlistButton = $('<div class="iptv-plus-button selector">Плейлист</div>');
             var reloadButton = $('<div class="iptv-plus-button selector">Обновить</div>');
 
             groupButton.on('hover:enter', function () { selectGroup(self); });
+            playlistButton.on('hover:enter', function () { editPlaylist(self); });
             reloadButton.on('hover:enter', function () {
                 self.activity.loader(true);
                 loadData(true).then(function () {
@@ -534,7 +570,7 @@
                     notify(error.message || 'Ошибка обновления');
                 });
             });
-            toolbar.append(groupButton, reloadButton);
+            toolbar.append(groupButton, playlistButton, reloadButton);
         };
 
         this.build = function () {
