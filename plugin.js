@@ -1,11 +1,16 @@
 (function () {
     'use strict';
 
-    if (window.lampa_iptv_plus_ready) return;
+    if (window.lampa_iptv_plus_ready) {
+        if (typeof window.lampa_iptv_plus_restore_menu === 'function') {
+            window.lampa_iptv_plus_restore_menu();
+        }
+        return;
+    }
     window.lampa_iptv_plus_ready = true;
 
     var PLUGIN = 'iptv_plus';
-    var VERSION = '1.0.0';
+    var VERSION = '1.0.1';
     var AUTO_EPG_URL = 'https://cdn.epg.one/edem.xml.gz';
     var AUTO_EPG_RU_URL = 'https://cdn.epg.one/ru.xml.gz';
     var AUTO_EPG_LITE_URL = 'https://cdn.epg.one/epg.xml';
@@ -1540,11 +1545,25 @@
 
     function addMenu() {
         if ($('.menu .menu__list .' + PLUGIN + '-menu').length) return;
+        var list = $('.menu .menu__list').eq(0);
+        if (!list.length) return;
         var button = $('<li class="menu__item selector ' + PLUGIN + '-menu"><div class="menu__ico">' + ICON + '</div><div class="menu__text">IPTV+</div></li>');
         button.on('hover:enter', function () {
             Lampa.Activity.push({ url: '', title: 'IPTV+', component: PLUGIN, page: 1 });
         });
-        $('.menu .menu__list').eq(0).append(button);
+        list.append(button);
+    }
+
+    function installMenu() {
+        window.lampa_iptv_plus_restore_menu = addMenu;
+        addMenu();
+
+        setTimeout(addMenu, 500);
+        setTimeout(addMenu, 2000);
+
+        Lampa.Listener.follow('menu', function (event) {
+            if (event.type === 'end') addMenu();
+        });
     }
 
     function addStyles() {
@@ -1601,7 +1620,7 @@
         Lampa.Component.add(PLUGIN, Component);
         addSettings();
         addStyles();
-        addMenu();
+        installMenu();
         console.log('IPTV+', 'plugin ready', VERSION);
     }
 
