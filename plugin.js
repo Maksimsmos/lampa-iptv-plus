@@ -5,7 +5,9 @@
     window.lampa_iptv_plus_ready = true;
 
     var PLUGIN = 'iptv_plus';
-    var VERSION = '0.4.0';
+    var VERSION = '0.5.0';
+    var AUTO_EPG_URL = 'https://cdn.epg.one/edem.xml.gz';
+    var AUTO_EPG_LITE_URL = 'https://cdn.epg.one/epg.xml';
     var network = new Lampa.Reguest();
     var state = {
         channels: [],
@@ -14,6 +16,8 @@
         epg: {},
         epgNames: {},
         playlistEpg: '',
+        archiveHint: false,
+        autoEpg: false,
         loadedAt: 0,
         component: null
     };
@@ -181,7 +185,13 @@
             }
         });
 
-        return { channels: channels, epgUrl: epgUrl };
+        return {
+            channels: channels,
+            epgUrl: epgUrl,
+            archiveHint: channels.some(function (channel) {
+                return channel.catchup.days > 0 || Boolean(channel.catchup.type || channel.catchup.source);
+            })
+        };
     }
 
     function parseXmltvDate(value) {
@@ -242,6 +252,123 @@
         });
 
         return { epg: epg, names: epgNames };
+    }
+
+    function decodeXml(value) {
+        return text(value).replace(/<[^>]*>/g, '').replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, function (full, entity) {
+            var named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+            if (named[entity]) return named[entity];
+            if (entity.indexOf('#x') === 0) return String.fromCharCode(parseInt(entity.slice(2), 16));
+            if (entity.charAt(0) === '#') return String.fromCharCode(parseInt(entity.slice(1), 10));
+            return full;
+        }).trim();
+    }
+
+    function xmlAttribute(source, name) {
+        var match = new RegExp('(?:^|\\s)' + name + '=(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(source);
+        return match ? decodeXml(match[1] || match[2] || '') : '';
+    }
+
+    function xmlValues(source, tag) {
+        var values = [];
+        var expression = new RegExp('<' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + tag + '\\s*>', 'gi');
+        var match;
+        while ((match = expression.exec(source))) values.push(decodeXml(match[1]));
+        return values;
+    }
+
+    function parseXmltvGzip(url) {
+        if (!window.fetch || !window.DecompressionStream || !window.TextDecoder) {
+            return Promise.reject(new Error('Распаковка XMLTV.GZ не поддерживается'));
+        }
+
+        var result = { epg: {}, names: {} };
+        var wantedNames = {};
+        var wantedIds = {};
+        var keepAfter = Date.now() - ((parseInt(field('archive_days') || 3, 10) + 1) * 86400000);
+        var keepBefore = Date.now() + (2 * 86400000);
+
+        state.channels.forEach(function (channel) {
+            wantedNames[normalize(channel.name)] = true;
+            if (channel.tvgName) wantedNames[normalize(channel.tvgName)] = true;
+            if (channel.id) wantedIds[channel.id] = true;
+        });
+
+        function accept(kind, attributes, body) {
+            if (kind === 'channel') {
+                var id = xmlAttribute(attributes, 'id');
+                var names = xmlValues(body, 'display-name');
+                var matched = names.some(function (name) { return wantedNames[normalize(name)]; });
+                if (!id || !matched) return;
+                wantedIds[id] = true;
+                names.forEach(function (name) { result.names[normalize(name)] = id; });
+                return;
+            }
+
+            var channelId = xmlAttribute(attributes, 'channel');
+            if (!wantedIds[channelId]) return;
+            var start = parseXmltvDate(xmlAttribute(attributes, 'start'));
+            var stop = parseXmltvDate(xmlAttribute(attributes, 'stop'));
+            if (!start || !stop || stop < keepAfter || start > keepBefore) return;
+            if (!result.epg[channelId]) result.epg[channelId] = [];
+            result.epg[channelId].push({
+                start: start,
+                stop: stop,
+                title: xmlValues(body, 'title')[0] || 'Без названия',
+                desc: xmlValues(body, 'desc')[0] || '',
+                category: xmlValues(body, 'category')[0] || ''
+            });
+        }
+
+        return window.fetch(url).then(function (response) {
+            if (!response.ok || !response.body) throw new Error('Не удалось загрузить автоматический EPG');
+            var stream = response.body.pipeThrough(new window.DecompressionStream('gzip'));
+            var reader = stream.getReader();
+            var decoder = new window.TextDecoder('utf-8');
+            var buffer = '';
+
+            function consume(final) {
+                var expression = /<(channel|programme)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi;
+                var match;
+                var consumed = 0;
+                while ((match = expression.exec(buffer))) {
+                    accept(match[1].toLowerCase(), match[2], match[3]);
+                    consumed = expression.lastIndex;
+                }
+                if (consumed) buffer = buffer.slice(consumed);
+                if (!final && buffer.length > 1048576) buffer = buffer.slice(Math.max(0, buffer.lastIndexOf('<')));
+            }
+
+            return new Promise(function (resolve, reject) {
+                function read() {
+                    reader.read().then(function (chunk) {
+                        if (chunk.done) {
+                            buffer += decoder.decode();
+                            consume(true);
+                            Object.keys(result.epg).forEach(function (id) {
+                                result.epg[id].sort(function (a, b) { return a.start - b.start; });
+                            });
+                            resolve(result);
+                            return;
+                        }
+                        buffer += decoder.decode(chunk.value, { stream: true });
+                        consume(false);
+                        read();
+                    }).catch(reject);
+                }
+                read();
+            });
+        });
+    }
+
+    function loadGuide(url, automatic) {
+        var gzip = /\.gz(?:$|[?#])/i.test(url);
+        var loading = gzip ? parseXmltvGzip(url) : requestText(url).then(parseXmltv);
+        if (!automatic) return loading;
+        return loading.catch(function (error) {
+            console.log('IPTV+', 'Automatic EPG gzip fallback', error);
+            return requestText(AUTO_EPG_LITE_URL).then(parseXmltv);
+        });
     }
 
     function epgId(channel) {
@@ -614,23 +741,31 @@
             state.visible = parsed.channels.slice();
             state.groups = parsed.channels.map(function (channel) { return channel.group; }).filter(function (group, index, all) { return all.indexOf(group) === index; });
             state.playlistEpg = parsed.epgUrl;
+            state.archiveHint = parsed.archiveHint;
             state.loadedAt = Date.now();
 
             var guideUrl = field('epg') || parsed.epgUrl;
+            var automatic = false;
+
+            if (!guideUrl && parsed.archiveHint) {
+                guideUrl = AUTO_EPG_URL;
+                automatic = true;
+            }
+
+            state.autoEpg = automatic;
             if (!guideUrl) {
                 state.epg = {};
                 state.epgNames = {};
                 return state;
             }
 
-            return requestText(guideUrl).then(function (xml) {
-                var guide = parseXmltv(xml);
+            return loadGuide(guideUrl, automatic).then(function (guide) {
                 state.epg = guide.epg;
                 state.epgNames = guide.names;
                 return state;
             }).catch(function (error) {
                 console.log('IPTV+', 'EPG load error', error);
-                notify('Плейлист загружен, но XMLTV недоступен');
+                notify(automatic ? 'Плейлист загружен, но автоматическая программа недоступна' : 'Плейлист загружен, но XMLTV недоступен');
                 state.epg = {};
                 state.epgNames = {};
                 return state;
@@ -657,6 +792,8 @@
             state.visible = [];
             state.epg = {};
             state.epgNames = {};
+            state.archiveHint = false;
+            state.autoEpg = false;
             state.loadedAt = 0;
             component.activity.loader(true);
 
@@ -722,7 +859,7 @@
         this.buildToolbar = function () {
             var toolbar = self.html.find('.iptv-plus-toolbar').empty();
             var playlistButton = $('<div class="iptv-plus-button selector"><b>＋</b> Плейлист</div>');
-            var epgButton = $('<div class="iptv-plus-button selector">Телепрограмма</div>');
+            var epgButton = $('<div class="iptv-plus-button selector">EPG' + (state.autoEpg ? ': AUTO' : ' вручную') + '</div>');
             var reloadButton = $('<div class="iptv-plus-button selector">↻ Обновить</div>');
 
             playlistButton.on('hover:enter', function () { editPlaylist(self); });
@@ -865,7 +1002,7 @@
         Lampa.SettingsApi.addParam({
             component: PLUGIN,
             param: { name: PLUGIN + '_epg', type: 'input', default: '' },
-            field: { name: 'URL XMLTV', description: 'Необязательно, если url-tvg указан в M3U' }
+            field: { name: 'URL XMLTV', description: 'Необязательно: для плейлистов с tvg-rec программа подбирается автоматически' }
         });
         Lampa.SettingsApi.addParam({
             component: PLUGIN,
@@ -881,6 +1018,8 @@
                 state.visible = [];
                 state.epg = {};
                 state.epgNames = {};
+                state.archiveHint = false;
+                state.autoEpg = false;
                 state.loadedAt = 0;
                 notify('Кеш IPTV+ очищен');
             }
