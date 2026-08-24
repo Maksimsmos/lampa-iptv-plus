@@ -10,10 +10,11 @@
     window.lampa_iptv_plus_ready = true;
 
     var PLUGIN = 'iptv_plus';
-    var VERSION = '1.0.1';
+    var VERSION = '1.0.2';
     var AUTO_EPG_URL = 'https://cdn.epg.one/edem.xml.gz';
     var AUTO_EPG_RU_URL = 'https://cdn.epg.one/ru.xml.gz';
     var AUTO_EPG_LITE_URL = 'https://cdn.epg.one/epg.xml';
+    var FFLATE_URL = 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js';
     var CHANNEL_PAGE_SIZE = 80;
     var network = new Lampa.Reguest();
     var state = {
@@ -31,6 +32,7 @@
         guideTicket: 0,
         archiveLoading: {},
         archiveReady: {},
+        archiveFailed: {},
         selectedChannel: '',
         selectedDay: '',
         loadedAt: 0,
@@ -342,9 +344,49 @@
         return values;
     }
 
+    var fflatePromise = null;
+
+    function loadFflate() {
+        if (window.fflate && window.fflate.Gunzip) return Promise.resolve(window.fflate);
+        if (fflatePromise) return fflatePromise;
+
+        fflatePromise = new Promise(function (resolve, reject) {
+            if (!window.document || !window.document.createElement) {
+                reject(new Error('Распаковка XMLTV.GZ не поддерживается'));
+                return;
+            }
+
+            var script = window.document.createElement('script');
+            var timer = setTimeout(function () {
+                script.onload = null;
+                script.onerror = null;
+                reject(new Error('Не удалось загрузить модуль распаковки архива'));
+            }, 15000);
+
+            script.async = true;
+            script.src = FFLATE_URL;
+            script.setAttribute('data-iptv-plus-fflate', 'true');
+            script.onload = function () {
+                clearTimeout(timer);
+                if (window.fflate && window.fflate.Gunzip) resolve(window.fflate);
+                else reject(new Error('Модуль распаковки архива не запустился'));
+            };
+            script.onerror = function () {
+                clearTimeout(timer);
+                reject(new Error('Не удалось загрузить модуль распаковки архива'));
+            };
+            (window.document.head || window.document.body).appendChild(script);
+        }).catch(function (error) {
+            fflatePromise = null;
+            throw error;
+        });
+
+        return fflatePromise;
+    }
+
     function parseXmltvStream(url, gzip, selectedChannels, timeout) {
-        if (!window.fetch || !window.TextDecoder || (gzip && !window.DecompressionStream)) {
-            return Promise.reject(new Error(gzip ? 'Распаковка XMLTV.GZ не поддерживается' : 'Потоковая загрузка XMLTV не поддерживается'));
+        if (!window.fetch || !window.TextDecoder) {
+            return Promise.reject(new Error('Потоковая загрузка XMLTV не поддерживается'));
         }
 
         var result = { epg: {}, names: {} };
@@ -404,8 +446,6 @@
 
         var loading = window.fetch(url, options).then(function (response) {
             if (!response.ok || !response.body) throw new Error('Не удалось загрузить автоматический EPG');
-            var stream = gzip ? response.body.pipeThrough(new window.DecompressionStream('gzip')) : response.body;
-            var reader = stream.getReader();
             var decoder = new window.TextDecoder('utf-8');
             var buffer = '';
 
@@ -426,29 +466,88 @@
                 }
             }
 
-            return new Promise(function (resolve, reject) {
-                function read() {
-                    reader.read().then(function (chunk) {
-                        if (chunk.done) {
-                            buffer += decoder.decode();
-                            consume(true);
-                            Object.keys(result.epg).forEach(function (id) {
-                                result.epg[id].sort(function (a, b) { return a.start - b.start; });
-                            });
+            function finish(resolve) {
+                Object.keys(result.epg).forEach(function (id) {
+                    result.epg[id].sort(function (a, b) { return a.start - b.start; });
+                });
+                clearTimeout(timer);
+                resolve(result);
+            }
+
+            function readNative(stream) {
+                var reader = stream.getReader();
+                return new Promise(function (resolve, reject) {
+                    function read() {
+                        reader.read().then(function (chunk) {
+                            if (chunk.done) {
+                                buffer += decoder.decode();
+                                consume(true);
+                                finish(resolve);
+                                return;
+                            }
+                            buffer += decoder.decode(chunk.value, { stream: true });
+                            consume(false);
+                            read();
+                        }).catch(function (error) {
                             clearTimeout(timer);
-                            resolve(result);
-                            return;
-                        }
-                        buffer += decoder.decode(chunk.value, { stream: true });
-                        consume(false);
-                        read();
-                    }).catch(function (error) {
+                            reject(error);
+                        });
+                    }
+                    read();
+                });
+            }
+
+            function readFflate(fflate) {
+                var reader = response.body.getReader();
+                return new Promise(function (resolve, reject) {
+                    var completed = false;
+                    var gunzip;
+
+                    try {
+                        gunzip = new fflate.Gunzip(function (chunk, final) {
+                            try {
+                                buffer += decoder.decode(chunk, { stream: !final });
+                                consume(Boolean(final));
+                                if (final && !completed) {
+                                    completed = true;
+                                    finish(resolve);
+                                }
+                            } catch (error) {
+                                completed = true;
+                                clearTimeout(timer);
+                                reject(error);
+                            }
+                        });
+                    } catch (error) {
                         clearTimeout(timer);
                         reject(error);
-                    });
-                }
-                read();
-            });
+                        return;
+                    }
+
+                    function read() {
+                        reader.read().then(function (part) {
+                            if (completed) return;
+                            try {
+                                gunzip.push(part.value || new Uint8Array(0), Boolean(part.done));
+                                if (!part.done) read();
+                            } catch (error) {
+                                completed = true;
+                                clearTimeout(timer);
+                                reject(error);
+                            }
+                        }).catch(function (error) {
+                            completed = true;
+                            clearTimeout(timer);
+                            reject(error);
+                        });
+                    }
+                    read();
+                });
+            }
+
+            if (!gzip) return readNative(response.body);
+            if (window.DecompressionStream) return readNative(response.body.pipeThrough(new window.DecompressionStream('gzip')));
+            return loadFflate().then(readFflate);
         });
 
         return Promise.race([loading, timeoutPromise]).then(function (guide) {
@@ -466,7 +565,7 @@
 
     function loadGuide(url, selectedChannels, timeout) {
         var gzip = /\.gz(?:$|[?#])/i.test(url);
-        var canStream = window.fetch && window.TextDecoder && (!gzip || window.DecompressionStream);
+        var canStream = window.fetch && window.TextDecoder;
         if (canStream) return parseXmltvStream(url, gzip, selectedChannels, timeout);
         if (gzip) return Promise.reject(new Error('Это устройство не поддерживает XMLTV.GZ'));
         return requestText(url).then(parseXmltv);
@@ -554,6 +653,7 @@
         state.archiveLoading[key] = loadGuide(source, [channel], 60000).then(function (guide) {
             mergeGuide(guide, false);
             state.archiveReady[key] = true;
+            delete state.archiveFailed[key];
             saveArchiveGuide(channel, guide);
             delete state.archiveLoading[key];
             refreshGuideUi();
@@ -561,6 +661,8 @@
         }).catch(function (error) {
             console.log('IPTV+', 'Archive guide load error', error);
             delete state.archiveLoading[key];
+            state.archiveFailed[key] = error && error.message ? error.message : 'Не удалось загрузить архив';
+            refreshGuideUi();
             throw error;
         });
 
@@ -783,7 +885,8 @@
         var guide = recentPrograms(channel);
         var current = currentProgramIndex(channel);
         var archiveKey = guideCacheKey(channel);
-        var needsHistory = state.autoEpg && channel.catchup.days > 0 && state.guideMode !== 'full' && !state.archiveReady[archiveKey];
+        var archiveError = state.archiveFailed[archiveKey];
+        var needsHistory = state.autoEpg && channel.catchup.days > 0 && state.guideMode !== 'full' && !state.archiveReady[archiveKey] && !archiveError;
         var items = [
             {
                 title: '▶ Прямой эфир',
@@ -838,6 +941,13 @@
                 noenter: true
             });
         }
+        if (archiveError) {
+            items.push({
+                title: '↻ Повторить загрузку архива',
+                subtitle: archiveError,
+                action: 'retry-archive'
+            });
+        }
 
         state.selectedChannel = archiveKey;
         Lampa.Select.show({
@@ -860,6 +970,10 @@
                     state.selectedChannel = '';
                     Lampa.Select.hide();
                     playArchive(channel, item.program, guide);
+                } else if (item.action === 'retry-archive') {
+                    delete state.archiveFailed[archiveKey];
+                    Lampa.Select.hide();
+                    showChannel(channel, index);
                 }
             },
             onBack: function () {
@@ -1349,6 +1463,8 @@
 
             var panel = self.html.find('.iptv-plus-detail').empty().addClass('open');
             var now = Date.now();
+            var archiveKey = guideCacheKey(channel);
+            var archiveError = state.archiveFailed[archiveKey];
             var allPrograms = programs(channel).filter(function (program) {
                 return program.stop >= now - ((channel.catchup.days || 1) * 86400000) && program.start <= now + (2 * 86400000);
             });
@@ -1375,6 +1491,7 @@
             var favorite = $('<div class="iptv-plus-action selector" data-detail-action="favorite">' + (isFavorite(channel) ? '♥ В Favorites' : '♡ В Favorites') + '</div>');
             actions.append(back, live, favorite);
             if (canArchive(channel, current)) actions.append('<div class="iptv-plus-action selector" data-detail-action="restart">↶ С начала</div>');
+            if (archiveError) actions.append('<div class="iptv-plus-action selector" data-detail-action="retry-archive">↻ Архив</div>');
 
             var body = $('<div class="iptv-plus-detail-body"><div class="iptv-plus-days"></div><div class="iptv-plus-schedule"></div></div>');
             var dayBar = body.find('.iptv-plus-days');
@@ -1405,13 +1522,15 @@
                 schedule.append(item);
             });
 
-            var archiveKey = guideCacheKey(channel);
-            var needsHistory = state.autoEpg && channel.catchup.days > 0 && state.guideMode !== 'full' && !state.archiveReady[archiveKey];
+            var needsHistory = state.autoEpg && channel.catchup.days > 0 && state.guideMode !== 'full' && !state.archiveReady[archiveKey] && !archiveError;
             if (!selectedPrograms.length) {
                 schedule.append('<div class="iptv-plus-schedule-empty"><b>' + (state.guideLoading || state.archiveLoading[archiveKey] ? 'Программа загружается…' : 'Нет программы на выбранный день') + '</b><span>Прямой эфир можно запустить сразу.</span></div>');
             }
             if (needsHistory) {
                 schedule.prepend('<div class="iptv-plus-schedule-loading"><i></i><span>' + (state.archiveLoading[archiveKey] ? 'Загружаю архив прошлых дней…' : 'Подготавливаю архив…') + '</span></div>');
+            }
+            if (archiveError) {
+                schedule.prepend('<div class="iptv-plus-schedule-empty"><b>Архивная программа не загрузилась</b><span>' + escapeHtml(archiveError) + '</span></div>');
             }
 
             panel.append(header, actions, body);
@@ -1429,6 +1548,12 @@
             actions.find('[data-detail-action="restart"]').on('hover:enter', function () {
                 self.closeChannel();
                 playArchive(channel, current, allPrograms);
+            });
+            actions.find('[data-detail-action="retry-archive"]').on('hover:enter', function () {
+                delete state.archiveFailed[archiveKey];
+                self.detailLast = null;
+                self.renderChannel(false);
+                self.startDetail();
             });
             dayBar.find('.iptv-plus-day').on('hover:enter', function () {
                 self.detailDay = $(this).attr('data-day');
@@ -1534,6 +1659,7 @@
                 state.guidePromise = null;
                 state.archiveLoading = {};
                 state.archiveReady = {};
+                state.archiveFailed = {};
                 state.selectedChannel = '';
                 state.guideTicket++;
                 state.loadedAt = 0;
