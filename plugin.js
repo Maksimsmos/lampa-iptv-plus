@@ -10,7 +10,7 @@
     window.lampa_iptv_plus_ready = true;
 
     var PLUGIN = 'iptv_plus';
-    var VERSION = '1.0.2';
+    var VERSION = '1.2.0';
     var AUTO_EPG_URL = 'https://cdn.epg.one/edem.xml.gz';
     var AUTO_EPG_RU_URL = 'https://cdn.epg.one/ru.xml.gz';
     var AUTO_EPG_LITE_URL = 'https://cdn.epg.one/epg.xml';
@@ -21,6 +21,7 @@
         channels: [],
         visible: [],
         groups: [],
+        groupCounts: {},
         epg: {},
         epgNames: {},
         playlistEpg: '',
@@ -105,6 +106,17 @@
         return Array.isArray(saved) ? saved : [];
     }
 
+    function favoriteLookup() {
+        var lookup = {};
+        favoriteIds().forEach(function (key) { lookup[key] = true; });
+        return lookup;
+    }
+
+    function favoriteInLookup(channel, lookup) {
+        var legacy = legacyChannelKey(channel);
+        return Boolean(lookup[channelKey(channel)] || (legacy && lookup[legacy]));
+    }
+
     function isFavorite(channel) {
         var favorites = favoriteIds();
         return favorites.indexOf(channelKey(channel)) >= 0 || (legacyChannelKey(channel) && favorites.indexOf(legacyChannelKey(channel)) >= 0);
@@ -133,10 +145,6 @@
         Lampa.Storage.set(PLUGIN + '_last_channel', key);
         if (state.component) {
             state.component.historyDirty = true;
-            if (!state.component.detailChannel && state.component.build) {
-                state.component.historyDirty = false;
-                state.component.build();
-            }
         }
     }
 
@@ -167,6 +175,29 @@
         return match ? (match[1] || match[2] || match[3] || '') : '';
     }
 
+    function archiveDays(daysValue, recValue, timeshiftValue, secondsValue) {
+        var explicitDays = parseFloat(daysValue);
+        if (isFinite(explicitDays) && explicitDays > 0) return Math.ceil(explicitDays);
+
+        var rec = parseFloat(recValue);
+        if (isFinite(rec) && rec > 1) return Math.ceil(rec);
+        if (rec === 1) return Math.max(1, parseInt(field('archive_days') || 3, 10) || 3);
+
+        var timeshift = parseFloat(timeshiftValue);
+        if (isFinite(timeshift) && timeshift > 0) return Math.ceil(timeshift);
+
+        var seconds = parseFloat(secondsValue);
+        if (isFinite(seconds) && seconds > 0) return Math.max(1, Math.ceil(seconds / 86400));
+
+        return 0;
+    }
+
+    function epgShiftMilliseconds(value) {
+        var shift = parseFloat(value);
+        if (!isFinite(shift) || !shift) return 0;
+        return Math.abs(shift) <= 12 ? shift * 3600000 : shift * 1000;
+    }
+
     function splitUrlHeaders(source) {
         var parts = text(source).split('|');
         var headers = {};
@@ -190,8 +221,11 @@
         var headerCatchup = {
             type: attr(header, 'catchup'),
             source: attr(header, 'catchup-source'),
-            days: attr(header, 'catchup-days') || attr(header, 'tvg-rec') || attr(header, 'timeshift'),
-            rec: attr(header, 'tvg-rec')
+            days: attr(header, 'catchup-days'),
+            rec: attr(header, 'tvg-rec'),
+            timeshift: attr(header, 'timeshift'),
+            seconds: attr(header, 'catchup-time'),
+            epgShift: attr(header, 'tvg-shift')
         };
         var epgUrl = attr(header, 'url-tvg') || attr(header, 'x-tvg-url');
         var channels = [];
@@ -205,7 +239,12 @@
                 var comma = line.lastIndexOf(',');
                 var channelName = comma >= 0 ? line.slice(comma + 1).trim() : 'Без названия';
                 var recDays = attr(line, 'tvg-rec') || headerCatchup.rec;
-                var days = attr(line, 'catchup-days') || recDays || attr(line, 'timeshift') || headerCatchup.days;
+                var days = archiveDays(
+                    attr(line, 'catchup-days') || headerCatchup.days,
+                    recDays,
+                    attr(line, 'timeshift') || headerCatchup.timeshift,
+                    attr(line, 'catchup-time') || headerCatchup.seconds
+                );
                 var type = attr(line, 'catchup') || headerCatchup.type;
                 var sourceValue = attr(line, 'catchup-source') || headerCatchup.source;
 
@@ -220,10 +259,11 @@
                     group: attr(line, 'group-title') || 'Без группы',
                     url: '',
                     headers: {},
+                    epgShift: epgShiftMilliseconds(attr(line, 'tvg-shift') || headerCatchup.epgShift),
                     catchup: {
                         type: type,
                         source: sourceValue,
-                        days: Math.max(0, parseInt(days || field('archive_days') || 3, 10) || 0)
+                        days: days
                     }
                 };
                 return;
@@ -272,6 +312,15 @@
         return utc - (match[7] === '+' ? offset : -offset);
     }
 
+    function guidePastDays(selectedChannels) {
+        var configured = Math.max(1, parseInt(field('archive_days') || 3, 10) || 3);
+        var channels = selectedChannels && selectedChannels.length ? selectedChannels : state.channels;
+        (channels || []).forEach(function (channel) {
+            configured = Math.max(configured, parseInt(channel && channel.catchup && channel.catchup.days || 0, 10) || 0);
+        });
+        return configured;
+    }
+
     function childText(node, tag) {
         var child = node.getElementsByTagName(tag)[0];
         return child ? text(child.textContent).trim() : '';
@@ -285,7 +334,7 @@
         var epgNames = {};
         var channelNodes = documentXml.getElementsByTagName('channel');
         var programNodes = documentXml.getElementsByTagName('programme');
-        var keepAfter = Date.now() - ((parseInt(field('archive_days') || 3, 10) + 1) * 86400000);
+        var keepAfter = Date.now() - ((guidePastDays() + 1) * 86400000);
         var keepBefore = Date.now() + (2 * 86400000);
         var i;
 
@@ -393,7 +442,7 @@
         var wantedExactNames = {};
         var wantedNames = {};
         var wantedIds = {};
-        var keepAfter = Date.now() - ((parseInt(field('archive_days') || 3, 10) + 1) * 86400000);
+        var keepAfter = Date.now() - ((guidePastDays(selectedChannels) + 1) * 86400000);
         var keepBefore = Date.now() + (2 * 86400000);
 
         (selectedChannels || state.channels).forEach(function (channel) {
@@ -644,13 +693,41 @@
         }
     }
 
+    function guideProgramsForChannel(channel, guide) {
+        var id = '';
+        var names = guide.names || {};
+        var epg = guide.epg || {};
+        if (channel.id && epg[channel.id]) id = channel.id;
+        else if (channel.tvgName && names['exact:' + normalizeExact(channel.tvgName)]) id = names['exact:' + normalizeExact(channel.tvgName)];
+        else if (names['exact:' + normalizeExact(channel.name)]) id = names['exact:' + normalizeExact(channel.name)];
+        else if (channel.tvgName && names['relaxed:' + normalize(channel.tvgName)]) id = names['relaxed:' + normalize(channel.tvgName)];
+        else if (names['relaxed:' + normalize(channel.name)]) id = names['relaxed:' + normalize(channel.name)];
+        return id && epg[id] ? epg[id] : [];
+    }
+
     function loadArchiveGuide(channel) {
         var key = guideCacheKey(channel);
         if (state.guideMode === 'full' || restoreArchiveGuide(channel)) return Promise.resolve(state);
         if (state.archiveLoading[key]) return state.archiveLoading[key];
 
         var source = /[а-яё]/i.test(channel.name) ? AUTO_EPG_RU_URL : AUTO_EPG_URL;
-        state.archiveLoading[key] = loadGuide(source, [channel], 60000).then(function (guide) {
+        var fallbackSource = source === AUTO_EPG_RU_URL ? AUTO_EPG_URL : AUTO_EPG_RU_URL;
+
+        function loadMatchingGuide(url) {
+            return loadGuide(url, [channel], 60000).then(function (guide) {
+                var oldest = Date.now() - ((channel.catchup.days || 1) * 86400000);
+                var hasHistory = guideProgramsForChannel(channel, guide).some(function (program) {
+                    return program.start >= oldest && program.stop < Date.now();
+                });
+                if (!hasHistory) throw new Error('В телегиде не найдены прошлые передачи этого канала');
+                return guide;
+            });
+        }
+
+        state.archiveLoading[key] = loadMatchingGuide(source).catch(function (firstError) {
+            console.log('IPTV+', 'Primary archive guide mismatch', firstError);
+            return loadMatchingGuide(fallbackSource);
+        }).then(function (guide) {
             mergeGuide(guide, false);
             state.archiveReady[key] = true;
             delete state.archiveFailed[key];
@@ -679,14 +756,32 @@
     }
 
     function programs(channel) {
-        return state.epg[epgId(channel)] || [];
+        var list = state.epg[epgId(channel)] || [];
+        var shift = channel && channel.epgShift || 0;
+        if (!shift) return list;
+        return list.map(function (program) {
+            return {
+                start: program.start + shift,
+                stop: program.stop + shift,
+                title: program.title,
+                desc: program.desc,
+                category: program.category
+            };
+        });
     }
 
-    function currentProgramIndex(channel, at) {
+    function currentProgramIndex(channel, at, preparedPrograms) {
         at = at || Date.now();
-        var list = programs(channel);
-        for (var i = 0; i < list.length; i++) {
-            if (list[i].start <= at && list[i].stop > at) return i;
+        var list = preparedPrograms || programs(channel);
+        var low = 0;
+        var high = list.length - 1;
+
+        while (low <= high) {
+            var middle = (low + high) >> 1;
+            var program = list[middle];
+            if (program.start > at) high = middle - 1;
+            else if (program.stop <= at) low = middle + 1;
+            else return middle;
         }
         return -1;
     }
@@ -715,10 +810,50 @@
         return text(pattern || 'yyyy-MM-dd:HH-mm').replace(/yyyy|MM|dd|HH|mm|ss/g, function (key) { return values[key]; });
     }
 
+    function normalizeCatchupVariables(template) {
+        var aliases = {
+            utc: 'start',
+            lutc: 'timestamp',
+            current_utc: 'timestamp',
+            utcend: 'end',
+            start_iso: 'start_iso',
+            end_iso: 'end_iso',
+            now_iso: 'now_iso'
+        };
+        return text(template).replace(/(^|[^$])\{([a-z_][a-z0-9_-]*)\}/gi, function (full, prefix, name) {
+            var normalized = aliases[name.toLowerCase()] || name;
+            return prefix + '${' + normalized + '}';
+        });
+    }
+
+    function setCatchupQuery(template, name, value) {
+        var hashIndex = template.indexOf('#');
+        var hash = hashIndex >= 0 ? template.slice(hashIndex) : '';
+        var base = hashIndex >= 0 ? template.slice(0, hashIndex) : template;
+        var expression = new RegExp('([?&])' + name + '=[^&#]*', 'i');
+        if (expression.test(base)) {
+            base = base.replace(expression, function (full, separator) { return separator + name + '=' + value; });
+        } else {
+            base += (base.indexOf('?') >= 0 ? '&' : '?') + name + '=' + value;
+        }
+        return base + hash;
+    }
+
+    function shiftTemplate(url) {
+        var template = normalizeCatchupVariables(url);
+        template = setCatchupQuery(template, 'utc', '${start}');
+        template = setCatchupQuery(template, 'lutc', '${timestamp}');
+        return template;
+    }
+
+    function hasCatchupTimeVariables(template) {
+        return /\$\{(?:start|utc|end|utcend|timestamp|lutc|current_utc|now|offset|duration|durationfs|durmin|start_iso|end_iso|now_iso|start-|end-|\([ben])/i.test(template);
+    }
+
     function catchupTemplate(channel) {
         var type = text(channel.catchup.type).toLowerCase();
-        var source = channel.catchup.source || '';
-        var url = channel.url;
+        var source = normalizeCatchupVariables(channel.catchup.source || '');
+        var url = normalizeCatchupVariables(channel.url);
 
         if (!type) {
             if (source) type = /^https?:\/\//i.test(source) ? 'default' : 'append';
@@ -730,15 +865,24 @@
         if (type === 'disabled' || type === 'none') return false;
         if (type === 'default') {
             var defaultUrl = source || url;
-            return defaultUrl.indexOf('${') >= 0 ? defaultUrl : defaultUrl + (defaultUrl.indexOf('?') >= 0 ? '&' : '?') + 'utc=${start}&lutc=${timestamp}';
+            return hasCatchupTimeVariables(defaultUrl) ? defaultUrl : shiftTemplate(defaultUrl);
         }
         if (type === 'append') {
             var appended = (source && /^https?:\/\//i.test(source) ? '' : url) + (source || '');
-            return appended.indexOf('${') >= 0 ? appended : appended + (appended.indexOf('?') >= 0 ? '&' : '?') + 'utc=${start}&lutc=${timestamp}';
+            return hasCatchupTimeVariables(appended) ? appended : shiftTemplate(appended);
         }
-        if (type === 'shift' || type === 'timeshift') {
-            var shifted = source || url;
-            return shifted + (shifted.indexOf('?') >= 0 ? '&' : '?') + 'utc=${start}&lutc=${timestamp}';
+        if (type === 'shift') {
+            return shiftTemplate(source || url);
+        }
+        if (type === 'timeshift') {
+            var timeshifted = source || url;
+            timeshifted = setCatchupQuery(timeshifted, 'timeshift', '${start}');
+            return setCatchupQuery(timeshifted, 'timenow', '${timestamp}');
+        }
+        if (type === 'archive') {
+            var archived = source || url;
+            archived = setCatchupQuery(archived, 'archive', '${start}');
+            return setCatchupQuery(archived, 'archive_end', '${end}');
         }
         if (type === 'flussonic' || type === 'flussonic-hls' || type === 'flussonic-ts' || type === 'fs') {
             return url
@@ -773,10 +917,20 @@
             now: now,
             offset: Math.max(0, now - start),
             duration: duration,
-            durationfs: end > now ? 'now' : duration
+            durationfs: end > now ? 'now' : duration,
+            durmin: Math.max(1, Math.floor(duration / 60)),
+            start_iso: new Date(start * 1000).toISOString(),
+            end_iso: new Date(end * 1000).toISOString(),
+            now_iso: new Date(now * 1000).toISOString()
         };
 
-        return template.replace(/\$\{([^}]+)\}/g, function (full, expression) {
+        var startParts = { year: 'yyyy', mon: 'MM', day: 'dd', hour: 'HH', min: 'mm', sec: 'ss' };
+        Object.keys(startParts).forEach(function (part) {
+            values['start-' + part] = formatDate(start, startParts[part], false);
+            values['end-' + part] = formatDate(end, startParts[part], false);
+        });
+
+        return normalizeCatchupVariables(template).replace(/\$\{([^}]+)\}/g, function (full, expression) {
             var dateMatch = /^\(([ben])(u)?\)(.+)$/.exec(expression);
             if (dateMatch) {
                 var stamp = dateMatch[1] === 'b' ? start : dateMatch[1] === 'e' ? end : now;
@@ -785,6 +939,13 @@
             if (expression === '(d)M') return Math.max(1, Math.ceil(duration / 60));
             if (Object.prototype.hasOwnProperty.call(values, expression)) return encodeURIComponent(values[expression]);
             return full;
+        });
+    }
+
+    function prepareLiveUrl(url) {
+        var now = Math.floor(Date.now() / 1000);
+        return normalizeCatchupVariables(url).replace(/\$\{(start|utc|timestamp|lutc|current_utc|now)\}/gi, function () {
+            return String(now);
         });
     }
 
@@ -831,7 +992,6 @@
             return {
                 title: formatTime(item.start) + ' — ' + item.title,
                 url: buildArchiveUrl(channel, item),
-                need_check_live_stream: true,
                 error: function () {
                     notify('Архив не открылся. Попробуйте другую передачу или CDN провайдера');
                 }
@@ -840,7 +1000,9 @@
 
         Lampa.Player.runas(Lampa.Storage.field('player_iptv'));
         Lampa.Player.play(convert(program));
-        Lampa.Player.playlist((archiveList || []).filter(function (item) { return canArchive(channel, item); }).map(convert));
+        setTimeout(function () {
+            Lampa.Player.playlist((archiveList || []).filter(function (item) { return canArchive(channel, item); }).map(convert));
+        }, 0);
     }
 
     function recentPrograms(channel) {
@@ -1057,7 +1219,7 @@
             name: channel.name,
             group: channel.group,
             logo: channel.logo,
-            url: channel.url,
+            url: prepareLiveUrl(channel.url),
             original: channel,
             icons: playerIcons(channel)
         };
@@ -1065,15 +1227,16 @@
 
     function playLive(index) {
         var channels = state.visible;
-        if (!channels.length) return;
+        if (!channels.length || index < 0 || index >= channels.length) return notify('Канал больше не находится в выбранной категории');
 
         addToHistory(channels[index]);
 
         function getChannel(position) {
             var original = channels[position];
+            if (!original) return playerChannel(channels[index]);
             var channel = playerChannel(original);
             var list = programs(original);
-            var current = currentProgramIndex(original);
+            var current = currentProgramIndex(original, Date.now(), list);
 
             setTimeout(function () {
                 Lampa.Player.programReady({ channel: channel, position: Math.max(0, current), total: list.length });
@@ -1084,14 +1247,14 @@
         Lampa.Player.runas(Lampa.Storage.field('player_iptv'));
         Lampa.Player.iptv({
             title: channels[index].name,
-            url: channels[index].url,
+            url: prepareLiveUrl(channels[index].url),
             position: index,
             total: channels.length,
             onGetChannel: getChannel,
             onGetProgram: function (channel, position, container) {
                 var original = channel.original;
                 var list = programs(original);
-                var current = currentProgramIndex(original);
+                var current = currentProgramIndex(original, Date.now(), list);
                 var start = Math.max(0, Math.min(position, list.length - 1));
                 var target = container && container[0] ? container[0] : container;
                 var html = '';
@@ -1121,7 +1284,15 @@
             var parsed = parseM3U(m3u);
             state.channels = parsed.channels;
             state.visible = parsed.channels.slice();
-            state.groups = parsed.channels.map(function (channel) { return channel.group; }).filter(function (group, index, all) { return all.indexOf(group) === index; });
+            state.groups = [];
+            state.groupCounts = {};
+            parsed.channels.forEach(function (channel) {
+                if (!Object.prototype.hasOwnProperty.call(state.groupCounts, channel.group)) {
+                    state.groups.push(channel.group);
+                    state.groupCounts[channel.group] = 0;
+                }
+                state.groupCounts[channel.group]++;
+            });
             state.playlistEpg = parsed.epgUrl;
             state.archiveHint = parsed.archiveHint;
             state.loadedAt = Date.now();
@@ -1132,6 +1303,7 @@
             state.guidePromise = null;
             state.archiveLoading = {};
             state.archiveReady = {};
+            state.archiveFailed = {};
             state.guideTicket++;
 
             var guideUrl = field('epg') || parsed.epgUrl;
@@ -1215,10 +1387,13 @@
         this.detailIndex = -1;
         this.detailDay = '';
         this.detailLast = null;
+        this.detailPendingFocus = '';
         this.historyDirty = false;
+        this.channelFocus = {};
         this.html = $('<div class="iptv-plus-screen"><div class="iptv-plus-head"><div class="iptv-plus-title">IPTV+<span></span></div><div class="iptv-plus-clock"></div></div><div class="iptv-plus-toolbar"></div><div class="iptv-plus-layout"><div class="iptv-plus-sidebar"></div><div class="iptv-plus-list"></div></div><div class="iptv-plus-detail"></div></div>');
         this.last = null;
         this.clockTimer = 0;
+        this.archiveTimer = 0;
         this.renderLimit = CHANNEL_PAGE_SIZE;
 
         this.updateClock = function () {
@@ -1229,7 +1404,21 @@
 
         this.focused = function (element) {
             self.last = element;
+            if (element && $(element).hasClass('iptv-plus-channel')) {
+                self.channelFocus[self.category] = $(element).data('channel-key');
+            }
             if (element && element.scrollIntoView) element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        };
+
+        this.focusElement = function (element, container) {
+            if (!element) return false;
+            Lampa.Controller.collectionFocus(element, container || self.html);
+            return true;
+        };
+
+        this.focusedElement = function (container) {
+            var scope = container || self.html;
+            return scope.find('.selector.focus')[0] || null;
         };
 
         this.create = function () {
@@ -1293,9 +1482,9 @@
             toolbar.find('.selector').on('hover:focus', function () { self.focused(this); });
         };
 
-        this.buildCategories = function () {
+        this.buildCategories = function (favorites) {
             var sidebar = self.html.find('.iptv-plus-sidebar').empty();
-            var favoritesCount = state.channels.filter(isFavorite).length;
+            var favoritesCount = state.channels.filter(function (channel) { return favoriteInLookup(channel, favorites); }).length;
             var categories = [
                 { id: 'favorites', title: 'Favorites', icon: '♥', count: favoritesCount },
                 { id: 'all', title: 'All', icon: '▦', count: state.channels.length },
@@ -1314,7 +1503,7 @@
                     id: 'group:' + group,
                     title: group,
                     icon: text(group).slice(0, 1).toUpperCase(),
-                    count: state.channels.filter(function (channel) { return channel.group === group; }).length
+                    count: state.groupCounts[group] || 0
                 };
             }));
 
@@ -1346,11 +1535,12 @@
 
         this.build = function (preserveCategoryFocus) {
             self.last = null;
+            var favorites = favoriteLookup();
             self.buildToolbar();
-            self.buildCategories();
+            self.buildCategories(favorites);
             var listContainer = self.html.find('.iptv-plus-list').empty();
 
-            if (self.category === 'favorites') state.visible = state.channels.filter(isFavorite);
+            if (self.category === 'favorites') state.visible = state.channels.filter(function (channel) { return favoriteInLookup(channel, favorites); });
             else if (self.category === 'recent') state.visible = historyChannels();
             else if (self.category === 'search') {
                 var query = normalizeExact(self.searchQuery);
@@ -1370,12 +1560,12 @@
 
             displayed.forEach(function (channel, index) {
                 var channelPrograms = programs(channel);
-                var currentPosition = currentProgramIndex(channel);
+                var currentPosition = currentProgramIndex(channel, Date.now(), channelPrograms);
                 var current = currentPosition >= 0 ? channelPrograms[currentPosition] : null;
                 var progress = programProgress(current);
                 var time = current ? formatTime(current.start) + '–' + formatTime(current.stop) : 'Программа не найдена';
                 var quality = qualityLabel(channel);
-                var row = $('<div class="iptv-plus-channel selector"><div class="iptv-plus-number">' + pad((channel.index || 0) + 1) + '</div><div class="iptv-plus-logo"></div><div class="iptv-plus-channel-body"><div class="iptv-plus-name">' + escapeHtml(channel.name) + (quality ? ' <span class="iptv-plus-quality">' + quality + '</span>' : '') + '</div><div class="iptv-plus-now">' + escapeHtml(current ? current.title : channel.group) + '</div><div class="iptv-plus-time">' + escapeHtml(time) + '</div><div class="iptv-plus-progress"><i style="width:' + progress + '%"></i></div></div><div class="iptv-plus-channel-flags">' + (isFavorite(channel) ? '<div class="iptv-plus-heart">♥</div>' : '') + (canArchive(channel, current) ? '<div class="iptv-plus-archive">↶ Архив</div>' : '') + '<div class="iptv-plus-chevron">›</div></div></div>');
+                var row = $('<div class="iptv-plus-channel selector"><div class="iptv-plus-number">' + pad((channel.index || 0) + 1) + '</div><div class="iptv-plus-logo"></div><div class="iptv-plus-channel-body"><div class="iptv-plus-name">' + escapeHtml(channel.name) + (quality ? ' <span class="iptv-plus-quality">' + quality + '</span>' : '') + '</div><div class="iptv-plus-now">' + escapeHtml(current ? current.title : channel.group) + '</div><div class="iptv-plus-time">' + escapeHtml(time) + '</div><div class="iptv-plus-progress"><i style="width:' + progress + '%"></i></div></div><div class="iptv-plus-channel-flags">' + (favoriteInLookup(channel, favorites) ? '<div class="iptv-plus-heart">♥</div>' : '') + (canArchive(channel, current) ? '<div class="iptv-plus-archive">↶ Архив</div>' : '') + '<div class="iptv-plus-chevron">›</div></div></div>');
                 row.data('channel-key', channelKey(channel));
                 var logo = row.find('.iptv-plus-logo');
 
@@ -1408,13 +1598,17 @@
             }
 
             if (!self.last) {
+                var rememberedChannelKey = self.channelFocus[self.category];
                 var lastChannelKey = storage('last_channel', '');
                 self.html.find('.iptv-plus-channel').each(function () {
-                    if (!self.last && $(this).data('channel-key') === lastChannelKey) self.last = this;
+                    var key = $(this).data('channel-key');
+                    if (!self.last && rememberedChannelKey && key === rememberedChannelKey) self.last = this;
+                    if (!self.last && !rememberedChannelKey && key === lastChannelKey) self.last = this;
                 });
             }
 
             if (preserveCategoryFocus) self.last = self.html.find('.iptv-plus-category.active')[0];
+            if (!self.last) self.last = self.html.find('.iptv-plus-category.active')[0] || self.html.find('.iptv-plus-category')[0];
         };
 
         this.onFavoritesChanged = function () {
@@ -1428,7 +1622,8 @@
             return true;
         };
 
-        this.closeChannel = function () {
+        this.closeChannel = function (forPlayback) {
+            clearTimeout(self.archiveTimer);
             self.detailChannel = null;
             self.detailIndex = -1;
             self.detailDay = '';
@@ -1436,8 +1631,19 @@
             state.selectedChannel = '';
             state.selectedDay = '';
             self.html.find('.iptv-plus-detail').removeClass('open').empty();
-            self.build();
-            self.start();
+            if (!forPlayback) {
+                self.build();
+                self.start();
+            } else self.start();
+        };
+
+        this.detailFocusToken = function (element) {
+            if (!element) return '';
+            var item = $(element);
+            if (item.attr('data-detail-action')) return 'action:' + item.attr('data-detail-action');
+            if (item.attr('data-day')) return 'day:' + item.attr('data-day');
+            if (item.attr('data-program-start')) return 'program:' + item.attr('data-program-start');
+            return '';
         };
 
         this.startDetail = function () {
@@ -1448,11 +1654,21 @@
                     Lampa.Controller.collectionSet(panel);
                     Lampa.Controller.collectionFocus(self.detailLast || false, panel);
                 },
-                left: function () { if (Navigator.canmove('left')) Navigator.move('left'); },
-                right: function () { if (Navigator.canmove('right')) Navigator.move('right'); },
+                left: function () {
+                    var focused = self.focusedElement(panel);
+                    if (focused && $(focused).hasClass('iptv-plus-program')) {
+                        self.focusElement(panel.find('.iptv-plus-day.active')[0] || panel.find('.iptv-plus-day')[0], panel);
+                    } else if (Navigator.canmove('left')) Navigator.move('left');
+                },
+                right: function () {
+                    var focused = self.focusedElement(panel);
+                    if (focused && $(focused).hasClass('iptv-plus-day')) {
+                        self.focusElement(panel.find('.iptv-plus-program.now.selector')[0] || panel.find('.iptv-plus-program.selector')[0], panel);
+                    } else if (Navigator.canmove('right')) Navigator.move('right');
+                },
                 up: function () { if (Navigator.canmove('up')) Navigator.move('up'); },
                 down: function () { if (Navigator.canmove('down')) Navigator.move('down'); },
-                back: function () { self.closeChannel(); }
+                back: function () { self.closeChannel(false); }
             });
             Lampa.Controller.toggle('content');
         };
@@ -1461,7 +1677,9 @@
             var channel = self.detailChannel;
             if (!channel) return;
 
-            var panel = self.html.find('.iptv-plus-detail').empty().addClass('open');
+            var panel = self.html.find('.iptv-plus-detail');
+            var focusToken = preserveFocus ? self.detailFocusToken(self.detailLast) : '';
+            panel.empty().addClass('open');
             var now = Date.now();
             var archiveKey = guideCacheKey(channel);
             var archiveError = state.archiveFailed[archiveKey];
@@ -1474,7 +1692,10 @@
                 var key = dayKey(program.start);
                 if (days.indexOf(key) < 0) days.push(key);
             });
-            days.sort();
+            var todayKey = dayKey(now);
+            var pastDays = days.filter(function (key) { return key <= todayKey; }).sort().reverse();
+            var futureDays = days.filter(function (key) { return key > todayKey; }).sort();
+            days = pastDays.concat(futureDays);
             if (!self.detailDay || days.indexOf(self.detailDay) < 0) {
                 self.detailDay = days.indexOf(dayKey(now)) >= 0 ? dayKey(now) : (days[days.length - 1] || dayKey(now));
             }
@@ -1510,11 +1731,11 @@
                 var status = available ? (isNow ? 'Смотреть с начала' : 'Доступно в архиве') : isNow ? 'Сейчас в эфире' : isFuture ? 'Далее' : 'Архив недоступен';
                 var selectable = available || isNow;
                 var progress = isNow ? programProgress(program, now) : 0;
-                var item = $('<div class="iptv-plus-program' + (selectable ? ' selector' : ' disabled') + (isNow ? ' now' : '') + (available ? ' archived' : '') + '"><div class="iptv-plus-program-time">' + formatTime(program.start) + '<span>' + formatTime(program.stop) + '</span></div><div class="iptv-plus-program-copy"><div class="iptv-plus-program-title">' + escapeHtml(program.title) + '</div><div class="iptv-plus-program-desc">' + escapeHtml(program.desc || status) + '</div>' + (isNow ? '<div class="iptv-plus-program-progress"><i style="width:' + progress + '%"></i></div>' : '') + '</div><div class="iptv-plus-program-status">' + (available ? '↶ ' : isNow ? '● ' : '') + escapeHtml(status) + '</div></div>');
+                var item = $('<div class="iptv-plus-program' + (selectable ? ' selector' : ' disabled') + (isNow ? ' now' : '') + (available ? ' archived' : '') + '" data-program-start="' + program.start + '"><div class="iptv-plus-program-time">' + formatTime(program.start) + '<span>' + formatTime(program.stop) + '</span></div><div class="iptv-plus-program-copy"><div class="iptv-plus-program-title">' + escapeHtml(program.title) + '</div><div class="iptv-plus-program-desc">' + escapeHtml(program.desc || status) + '</div>' + (isNow ? '<div class="iptv-plus-program-progress"><i style="width:' + progress + '%"></i></div>' : '') + '</div><div class="iptv-plus-program-status">' + (available ? '↶ ' : isNow ? '● ' : '') + escapeHtml(status) + '</div></div>');
                 if (selectable) {
                     item.on('hover:enter', function () {
                         var index = self.detailIndex >= 0 ? self.detailIndex : state.visible.indexOf(channel);
-                        self.closeChannel();
+                        self.closeChannel(true);
                         if (available) playArchive(channel, program, allPrograms);
                         else playLive(index);
                     });
@@ -1538,15 +1759,15 @@
                 self.detailLast = this;
                 if (this.scrollIntoView) this.scrollIntoView({ block: 'nearest', inline: 'nearest' });
             });
-            back.on('hover:enter', self.closeChannel);
+            back.on('hover:enter', function () { self.closeChannel(false); });
             live.on('hover:enter', function () {
                 var index = self.detailIndex;
-                self.closeChannel();
+                self.closeChannel(true);
                 playLive(index);
             });
             favorite.on('hover:enter', function () { setFavorite(channel, !isFavorite(channel)); });
             actions.find('[data-detail-action="restart"]').on('hover:enter', function () {
-                self.closeChannel();
+                self.closeChannel(true);
                 playArchive(channel, current, allPrograms);
             });
             actions.find('[data-detail-action="retry-archive"]').on('hover:enter', function () {
@@ -1558,18 +1779,31 @@
             dayBar.find('.iptv-plus-day').on('hover:enter', function () {
                 self.detailDay = $(this).attr('data-day');
                 self.detailLast = null;
+                self.detailPendingFocus = 'schedule';
                 self.renderChannel(false);
                 self.startDetail();
             });
 
-            if (!preserveFocus || !self.detailLast || !panel[0].contains(self.detailLast)) self.detailLast = live[0];
+            var restored = null;
+            if (focusToken.indexOf('action:') === 0) restored = panel.find('[data-detail-action="' + focusToken.slice(7) + '"]')[0];
+            else if (focusToken.indexOf('day:') === 0) restored = panel.find('[data-day="' + focusToken.slice(4) + '"]')[0];
+            else if (focusToken.indexOf('program:') === 0) restored = panel.find('[data-program-start="' + focusToken.slice(8) + '"]')[0];
+            if (self.detailPendingFocus === 'schedule') {
+                restored = schedule.find('.iptv-plus-program.now.selector')[0] || schedule.find('.iptv-plus-program.selector')[0] || dayBar.find('.iptv-plus-day.active')[0];
+                self.detailPendingFocus = '';
+            }
+            self.detailLast = restored || live[0];
 
             if (needsHistory && !state.archiveLoading[archiveKey]) {
-                loadArchiveGuide(channel).then(function () {
-                    if (self.detailChannel === channel) self.renderChannel(true);
-                }).catch(function () {
-                    if (self.detailChannel === channel) notify('Не удалось загрузить архивную программу');
-                });
+                clearTimeout(self.archiveTimer);
+                self.archiveTimer = setTimeout(function () {
+                    if (self.detailChannel !== channel) return;
+                    loadArchiveGuide(channel).then(function () {
+                        if (self.detailChannel === channel) self.renderChannel(true);
+                    }).catch(function () {
+                        if (self.detailChannel === channel) notify('Не удалось загрузить архивную программу');
+                    });
+                }, 900);
             }
         };
 
@@ -1596,14 +1830,33 @@
             Lampa.Controller.add('content', {
                 link: self,
                 toggle: function () {
+                    if (self.historyDirty) {
+                        self.historyDirty = false;
+                        self.build();
+                    }
                     Lampa.Controller.collectionSet(self.html);
                     Lampa.Controller.collectionFocus(self.last || false, self.html);
                 },
                 left: function () {
-                    if (Navigator.canmove('left')) Navigator.move('left');
+                    var focused = self.focusedElement(self.html);
+                    if (focused && ($(focused).hasClass('iptv-plus-channel') || $(focused).hasClass('iptv-plus-more'))) {
+                        self.focusElement(self.html.find('.iptv-plus-category.active')[0] || self.html.find('.iptv-plus-category')[0]);
+                    } else if (focused && $(focused).hasClass('iptv-plus-category')) {
+                        Lampa.Controller.toggle('menu');
+                    } else if (Navigator.canmove('left')) Navigator.move('left');
                     else Lampa.Controller.toggle('menu');
                 },
-                right: function () { if (Navigator.canmove('right')) Navigator.move('right'); },
+                right: function () {
+                    var focused = self.focusedElement(self.html);
+                    if (focused && $(focused).hasClass('iptv-plus-category')) {
+                        var remembered = self.channelFocus[self.category];
+                        var target = null;
+                        self.html.find('.iptv-plus-channel').each(function () {
+                            if (!target && remembered && $(this).data('channel-key') === remembered) target = this;
+                        });
+                        self.focusElement(target || self.html.find('.iptv-plus-channel')[0] || self.html.find('.iptv-plus-more')[0]);
+                    } else if (Navigator.canmove('right')) Navigator.move('right');
+                },
                 up: function () {
                     if (Navigator.canmove('up')) Navigator.move('up');
                     else Lampa.Controller.toggle('head');
@@ -1619,6 +1872,7 @@
         this.render = function () { return self.html; };
         this.destroy = function () {
             clearInterval(self.clockTimer);
+            clearTimeout(self.archiveTimer);
             self.detailChannel = null;
             if (state.component === self) state.component = null;
             self.html.remove();
